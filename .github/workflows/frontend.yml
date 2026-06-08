@@ -1,0 +1,104 @@
+name: Frontend DevSecOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: frontend
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: frontend
+
+jobs:
+
+  build-scan-push:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Install Dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Build Frontend
+      run: |
+        cd frontend
+        npm run build
+
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarqube-scan-action@v7
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    - name: Setup Snyk
+      uses: snyk/actions/setup@master
+
+    - name: Snyk Dependency Scan
+      run: |
+        cd frontend
+        snyk test
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    - name: Trivy Filesystem Scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: fs
+        scan-ref: frontend
+
+    - name: Build Docker Image
+      run: |
+        docker build \
+        -t frontend:${{ github.sha }} \
+        ./frontend
+
+    - name: Trivy Image Scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: frontend:${{ github.sha }}
+        scan-type: image
+
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
+
+    - name: Login ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Tag Image
+      run: |
+        docker tag frontend:${{ github.sha }} \
+        ${{ steps.login-ecr.outputs.registry }}/frontend:${{ github.sha }}
+
+    - name: Push Image
+      run: |
+        docker push \
+        ${{ steps.login-ecr.outputs.registry }}/frontend:${{ github.sha }}
+
+    - name: Update Manifest Repo
+      run: |
+        git clone https://${{ secrets.MANIFEST_PAT }}@github.com/USERNAME/k8s-manifests.git
+
+        cd k8s-manifests
+
+        sed -i "s|image:.*frontend.*|image: ${{ steps.login-ecr.outputs.registry }}/frontend:${GITHUB_SHA}|g" frontend/deployment.yaml
+
+        git config user.email "actions@github.com"
+        git config user.name "github-actions"
+
+        git commit -am "Frontend image update"
+        git push
